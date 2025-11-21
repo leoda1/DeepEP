@@ -162,6 +162,97 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     }
 }
 
+__device__ static __forceinline__ uint64_t ibgda_get_clock_cycles() {
+    return clock64();
+}
+
+__device__ static __forceinline__ bool ibgda_time_elapsed(
+    uint64_t last_time, uint64_t interval_cycles) {
+    uint64_t current = ibgda_get_clock_cycles();
+    return (current - last_time) >= interval_cycles;
+}
+
+#define MLX5_CQE_OWNER_MASK 0x01
+__device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_device_cq_t* cq) {
+    if (cq == nullptr || cq->cqe == nullptr || cq->cons_idx == nullptr) {
+        return false;
+    }
+
+    auto state = ibgda_get_state();
+    const uint64_t timeout_cycles = static_cast<uint64_t>(25.0 * state->gpu_clock_freq_ghz * 1e9);
+    uint64_t start_time = ibgda_get_clock_cycles();
+
+    uint64_t cons_idx = *cq->cons_idx;
+    uint32_t cqe_idx = cons_idx & (cq->ncqes - 1);
+    struct mlx5_cqe64 *cqe = (struct mlx5_cqe64 *)((uintptr_t)cq->cqe + cqe_idx * sizeof(*cqe));
+    uint8_t expected_owner = (cons_idx & cq->ncqes) ? MLX5_CQE_OWNER_MASK : 0;
+
+    while ((ld_volatile_global(reinterpret_cast<const uint8_t*>(&cqe->op_own)) & MLX5_CQE_OWNER_MASK) != expected_owner) {
+        if (ibgda_time_elapsed(start_time, timeout_cycles)) {
+            // Timeout, consider it as a failure.
+            return true;
+        }
+    }
+    memory_fence_cta();
+
+    uint8_t syndrome = (ld_volatile_global(reinterpret_cast<const uint8_t*>(&cqe->op_own)) >> 4) & 0xF;
+    // syndrome == 0 indicate success
+    return (syndrome != 0);
+}
+
+__device__ static __forceinline__ bool nvshmemi_ibgda_use_backup_qp(int qp_idx, nvshmemi_ibgda_device_cq_t *cq) {
+    nvshmemi_ibgda_device_state_t* state = ibgda_get_state();
+    uint8_t health = state->globalmem.rc_health_status[qp_idx];
+    if (health == IBGDA_QP_HEALTH_FAILED) {
+        uint64_t switch_time = state->globalmem.rc_switch_time[qp_idx];
+        if (ibgda_time_elapsed(switch_time, state->recovery_interval_cycles)) {
+            state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_RECOVERING;
+            state->globalmem.rc_failure_count[qp_idx] = 0;
+            return false; // use main QP
+        }
+        return true;  // continue using backup QP
+    }
+    if (health == IBGDA_QP_HEALTH_GOOD) {
+        uint64_t last_check = state->globalmem.rc_last_check_time[qp_idx];
+        uint64_t current = ibgda_get_clock_cycles();
+        if ((current - last_check) < (state->recovery_interval_cycles / 10)) {
+            return false;
+        }
+        state->globalmem.rc_last_check_time[qp_idx] = current;
+        if (nvshmemi_ibgda_check_cq(cq)) {
+            uint32_t fail_count = atomicAdd(&state->globalmem.rc_failure_count[qp_idx], 1);
+            if (fail_count >= state->failure_threshold - 1) {
+                state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_FAILED;
+                state->globalmem.rc_switch_time[qp_idx] = current;
+                return true;
+            } else {
+                state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_SUSPECTED;
+                return false;
+            }
+        }
+        return false;
+    }
+    if (health == IBGDA_QP_HEALTH_SUSPECTED) {
+        if (nvshmemi_ibgda_check_cq(cq)) {
+            uint32_t fail_count = atomicAdd(&state->globalmem.rc_failure_count[qp_idx], 1);
+            if (fail_count >= state->failure_threshold - 1) {
+                state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_FAILED;
+                state->globalmem.rc_switch_time[qp_idx] = ibgda_get_clock_cycles();
+                return true;
+            }
+        } else {
+            state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_GOOD;
+            state->globalmem.rc_failure_count[qp_idx] = 0;
+        }
+        return false;
+    }
+    if (health == IBGDA_QP_HEALTH_RECOVERING) {
+        return false;
+    }
+    return false;
+}
+
+
 __device__ static __forceinline__ void ibgda_write_rdma_write_inl_wqe(
     nvshmemi_ibgda_device_qp_t* qp, const uint32_t* val, uint64_t raddr, __be32 rkey, uint16_t wqe_idx, void** out_wqes, uint32_t imm) {
     ibgda_ctrl_seg_t ctrl_seg;
@@ -535,96 +626,6 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_i
     auto state = ibgda_get_state();
     uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
-}
-
-#define MLX5_CQE_OWNER_MASK 0x01
-__device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_device_cq_t* cq) {
-    if (cq == nullptr || cq->cqe == nullptr || cq->cons_idx == nullptr) {
-        return false;
-    }
-
-    auto state = ibgda_get_state();
-    const uint64_t timeout_cycles = static_cast<uint64_t>(25.0 * state->gpu_clock_freq_ghz * 1e9);
-    uint64_t start_time = ibgda_get_clock_cycles();
-
-    uint64_t cons_idx = *cq->cons_idx;
-    uint32_t cqe_idx = cons_idx & (cq->ncqes - 1);
-    struct mlx5_cqe64 *cqe = (struct mlx5_cqe64 *)((uintptr_t)cq->cqe + cqe_idx * sizeof(*cqe));
-    uint8_t expected_owner = (cons_idx & cq->ncqes) ? MLX5_CQE_OWNER_MASK : 0;
-
-    while ((ld_volatile_global(reinterpret_cast<const uint8_t*>(&cqe->op_own)) & MLX5_CQE_OWNER_MASK) != expected_owner) {
-        if (ibgda_time_elapsed(start_time, timeout_cycles)) {
-            // Timeout, consider it as a failure.
-            return true;
-        }
-    }
-    memory_fence_cta();
-
-    uint8_t syndrome = (ld_volatile_global(reinterpret_cast<const uint8_t*>(&cqe->op_own)) >> 4) & 0xF;
-    // syndrome == 0 indicate success
-    return (syndrome != 0);
-}
-
-__device__ static __forceinline__ uint64_t ibgda_get_clock_cycles() {
-    return clock64();
-}
-
-__device__ static __forceinline__ bool ibgda_time_elapsed(
-    uint64_t last_time, uint64_t interval_cycles) {
-    uint64_t current = ibgda_get_clock_cycles();
-    return (current - last_time) >= interval_cycles;
-}
-
-__device__ static __forceinline__ bool nvshmemi_ibgda_use_backup_qp(int qp_idx, nvshmemi_ibgda_device_cq_t *cq) {
-    nvshmemi_ibgda_device_state_t* state = ibgda_get_state();
-    uint8_t health = state->globalmem.rc_health_status[qp_idx];
-    if (health == IBGDA_QP_HEALTH_FAILED) {
-        uint64_t switch_time = state->globalmem.rc_switch_time[qp_idx];
-        if (ibgda_time_elapsed(switch_time, state->recovery_interval_cycles)) {
-            state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_RECOVERING;
-            state->globalmem.rc_failure_count[qp_idx] = 0;
-            return false; // use main QP
-        }
-        return true;  // continue using backup QP
-    }
-    if (health == IBGDA_QP_HEALTH_GOOD) {
-        uint64_t last_check = state->globalmem.rc_last_check_time[qp_idx];
-        unint64_t current = ibgda_get_clock_cycles();
-        if ((current - last_check) < (state->recovery_interval_cycles / 10)) {
-            return false;
-        }
-        state->globalmem.rc_last_check_time[qp_idx] = current;
-        if (nvshmemi_ibgda_check_cq(cq)) {
-            uint32_t fail_count = atomicAdd(&state->globalmem.rc_failure_count[qp_idx], 1);
-            if (fail_count >= state->failure_threshold - 1) {
-                state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_FAILED;
-                state->globalmem.rc_switch_time[qp_idx] = current;
-                return true;
-            } else {
-                state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_SUSPECTED;
-                return false;
-            }
-        }
-        return false;
-    }
-    if (health == IBGDA_QP_HEALTH_SUSPECTED) {
-        if (ibgda_check_cq_error_lightweight(cq)) {
-            uint32_t fail_count = atomicAdd(&state->globalmem.rc_failure_count[qp_idx], 1);
-            if (fail_count >= state->failure_threshold - 1) {
-                state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_FAILED;
-                state->globalmem.rc_switch_time[qp_idx] = ibgda_get_clock_cycles();
-                return true;
-            }
-        } else {
-            state->globalmem.rc_health_status[qp_idx] = IBGDA_QP_HEALTH_GOOD;
-            state->globalmem.rc_failure_count[qp_idx] = 0;
-        }
-        return false;
-    }
-    if (health == IBGDA_QP_HEALTH_RECOVERING) {
-        return false;
-    }
-    return false;
 }
 
 }  // namespace deep_ep
