@@ -80,9 +80,31 @@ __device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int p
                 .rcs[pe * num_rc_per_pe * state->num_devices_initialized + id % (num_rc_per_pe * state->num_devices_initialized)];
 }
 
+__device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_backup_rc(int pe, int id) {
+    auto state = ibgda_get_state();
+    const int num_primary = state->ff ? state->ff->num_primary_devices : state->num_devices_initialized;
+    const int stride = state->ff->num_backup_rc_per_pe * num_primary;
+    const int offset = id % stride;
+    return &state->ff->backup_rcs[pe * stride + offset];
+}
+
 __device__ static __forceinline__ void ibgda_lock_acquire(int* lock) {
-    while (atomicCAS(lock, 0, 1) == 1)
-        ;
+    // #region agent log
+    uint64_t lock_start = clock64();
+    constexpr uint64_t kLockTimeoutCycles = static_cast<uint64_t>(5.0 * 1.5e9); // 5 seconds
+    int lock_iter = 0;
+    // #endregion
+    while (atomicCAS(lock, 0, 1) == 1) {
+        // #region agent log
+        if (++lock_iter % 1000000 == 0) {
+            uint64_t elapsed = clock64() - lock_start;
+            if (elapsed > kLockTimeoutCycles) {
+                printf("DEADLOCK_HYP_C: ibgda_lock_acquire timeout: lock=%d, elapsed=%llu cycles\n", *lock, elapsed);
+                break;
+            }
+        }
+        // #endregion
+    }
 
     // Prevent reordering before the lock is acquired
     memory_fence_cta();
@@ -151,8 +173,23 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
         (unsigned long long int*)(state->use_async_postsend ? qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head);
 
     // Wait for prior WQE slots to be filled first
-    while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx)
-        ;
+    // #region agent log
+    uint64_t submit_wait_start = clock64();
+    constexpr uint64_t kSubmitTimeoutCycles = static_cast<uint64_t>(10.0 * 1.5e9); // 10 seconds
+    int submit_wait_iter = 0;
+    // #endregion
+    while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx) {
+        // #region agent log
+        if (++submit_wait_iter % 1000000 == 0) {
+            uint64_t elapsed = clock64() - submit_wait_start;
+            if (elapsed > kSubmitTimeoutCycles) {
+                printf("DEADLOCK_HYP_A: ibgda_submit_requests timeout: base_wqe_idx=%llu, ready_idx=%llu, elapsed=%llu cycles\n", 
+                       base_wqe_idx, *ready_idx, elapsed);
+                break;
+            }
+        }
+        // #endregion
+    }
 
     // Always post, not in batch
     if (!state->use_async_postsend) {
@@ -172,91 +209,60 @@ __device__ static __forceinline__ bool ibgda_time_elapsed(
     return (current - last_time) >= interval_cycles;
 }
 
-#define MLX5_CQE_OWNER_MASK 0x01
-__device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_device_cq_t* cq) {
-    if (cq == nullptr || cq->cqe == nullptr || cq->cons_idx == nullptr) {
-        return false;
-    }
+// Wrap-safe CQ completion predicate reused by both polling and timed wait.
+// NVSHMEM convention: we compare against `idx` which is maintained as (wqe_idx + 1).
+__device__ static __forceinline__ bool ibgda_cq_completed(nvshmemi_ibgda_device_cq_t* cq, uint64_t idx) {
+    const auto cqe64 = static_cast<mlx5_cqe64*>(cq->cqe);
+    const uint32_t ncqes = cq->ncqes;
 
-    auto state = ibgda_get_state();
-    if (state->ff == nullptr) {
-        return false;  // No fault tolerance state
-    }
-    const uint64_t timeout_cycles = static_cast<uint64_t>(25.0 * state->ff->gpu_clock_freq_ghz * 1e9);
-    uint64_t start_time = ibgda_get_clock_cycles();
-
-    uint64_t cons_idx = *cq->cons_idx;
-    uint32_t cqe_idx = cons_idx & (cq->ncqes - 1);
-    struct mlx5_cqe64 *cqe = (struct mlx5_cqe64 *)((uintptr_t)cq->cqe + cqe_idx * sizeof(*cqe));
-    uint8_t expected_owner = (cons_idx & cq->ncqes) ? MLX5_CQE_OWNER_MASK : 0;
-
-    while ((ld_volatile_global(reinterpret_cast<const uint8_t*>(&cqe->op_own)) & MLX5_CQE_OWNER_MASK) != expected_owner) {
-        if (ibgda_time_elapsed(start_time, timeout_cycles)) {
-            // Timeout, consider it as a failure.
-            return true;
-        }
-    }
     memory_fence_cta();
+    if (*cq->cons_idx >= idx) return true;
 
-    uint8_t syndrome = (ld_volatile_global(reinterpret_cast<const uint8_t*>(&cqe->op_own)) >> 4) & 0xF;
-    // syndrome == 0 indicate success
-    return (syndrome != 0);
+    // See comments in `ibgda_poll_cq` for the wrap-safe comparison.
+    const uint16_t wqe_counter = HtoBE16(ld_na_relaxed(&cqe64->wqe_counter));
+    return (static_cast<uint16_t>(static_cast<uint16_t>(idx) - wqe_counter - static_cast<uint16_t>(2)) >= ncqes);
 }
 
-__device__ static __forceinline__ bool nvshmemi_ibgda_use_backup_qp(int qp_idx, nvshmemi_ibgda_device_cq_t *cq) {
-    nvshmemi_ibgda_device_state_t* state = ibgda_get_state();
-    if (state->ff == nullptr) {
-        return false;  // No fault tolerance state, use main QP
+#define MLX5_CQE_OWNER_MASK 0x01
+
+
+static __device__ uint32_t deep_ep_ibgda_primary_bad = 0;
+
+__device__ static __forceinline__ bool deep_ep_ibgda_primary_is_bad() {
+    return ld_na_relaxed(&deep_ep_ibgda_primary_bad) != 0;
+}
+
+// Check if WQE completed, blocking wait with timeout.
+// Returns true if timeout (caller should switch to backup), false if success.
+// This is designed for "fast exit" in healthy case: it polls with a small backoff.
+__device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_device_cq_t* cq,
+                                                               uint64_t expected_wqe_idx,
+                                                               uint32_t /*primary_dev_idx*/) {
+    if (cq == nullptr || cq->cqe == nullptr) {
+        return true;  // No CQ = failure
     }
-    auto ft = state->ff;
-    uint8_t health = ft->rc_health_status[qp_idx];
-    if (health == IBGDA_QP_HEALTH_FAILED) {
-        uint64_t switch_time = ft->rc_switch_time[qp_idx];
-        if (ibgda_time_elapsed(switch_time, ft->recovery_interval_cycles)) {
-            ft->rc_health_status[qp_idx] = IBGDA_QP_HEALTH_RECOVERING;
-            ft->rc_failure_count[qp_idx] = 0;
-            return false; // use main QP
+    constexpr uint64_t kTimeoutCycles = static_cast<uint64_t>(5.0 * 1.5e9);
+    constexpr int kSpinIters = 256;  // quick spins before backoff
+    uint64_t start_time = ibgda_get_clock_cycles();
+
+    // We follow NVSHMEM semantics: compare against (wqe_idx + 1).
+    const uint64_t idx = expected_wqe_idx;
+    int spins = 0;
+    do {
+        if (ibgda_cq_completed(cq, idx)) return false;  // Completed successfully
+
+        // Cheap backoff to reduce SM pressure in long tail.
+        if (++spins > kSpinIters) {
+            __nanosleep(64);
+            spins = 0;
         }
-        return true;  // continue using backup QP
-    }
-    if (health == IBGDA_QP_HEALTH_GOOD) {
-        uint64_t last_check = ft->rc_last_check_time[qp_idx];
-        uint64_t current = ibgda_get_clock_cycles();
-        if ((current - last_check) < (ft->recovery_interval_cycles / 10)) {
-            return false;
+
+        if ((ibgda_get_clock_cycles() - start_time) > kTimeoutCycles) {
+            // Sticky failover: mark primary as bad globally.
+            atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad), 1u);
+            return true;  // Timeout = failure
         }
-        ft->rc_last_check_time[qp_idx] = current;
-        if (nvshmemi_ibgda_check_cq(cq)) {
-            uint32_t fail_count = atomicAdd(&ft->rc_failure_count[qp_idx], 1);
-            if (fail_count >= ft->failure_threshold - 1) {
-                ft->rc_health_status[qp_idx] = IBGDA_QP_HEALTH_FAILED;
-                ft->rc_switch_time[qp_idx] = current;
-                return true;
-            } else {
-                ft->rc_health_status[qp_idx] = IBGDA_QP_HEALTH_SUSPECTED;
-                return false;
-            }
-        }
-        return false;
-    }
-    if (health == IBGDA_QP_HEALTH_SUSPECTED) {
-        if (nvshmemi_ibgda_check_cq(cq)) {
-            uint32_t fail_count = atomicAdd(&ft->rc_failure_count[qp_idx], 1);
-            if (fail_count >= ft->failure_threshold - 1) {
-                ft->rc_health_status[qp_idx] = IBGDA_QP_HEALTH_FAILED;
-                ft->rc_switch_time[qp_idx] = ibgda_get_clock_cycles();
-                return true;
-            }
-        } else {
-            ft->rc_health_status[qp_idx] = IBGDA_QP_HEALTH_GOOD;
-            ft->rc_failure_count[qp_idx] = 0;
-        }
-        return false;
-    }
-    if (health == IBGDA_QP_HEALTH_RECOVERING) {
-        return false;
-    }
-    return false;
+    } while (true);
 }
 
 
@@ -300,9 +306,14 @@ ibgda_get_lkey_and_rkey(uint64_t laddr, __be32* lkey, uint64_t raddr, int dst_pe
     auto state = ibgda_get_state();
     auto heap_start = reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base);
     auto log2_cumem_granularity = state->log2_cumem_granularity;
+    // Total devices includes both primary and backup devices for FT lkey/rkey indexing
+    // Primary QPs use dev_idx in [0, num_devices_initialized)
+    // Backup QPs use dev_idx in [num_devices_initialized, num_devices_initialized + num_backup_devices)
+    int num_backup_devs = state->ff ? state->ff->num_backup_devices : 0;
+    int total_devs = state->num_devices_initialized + num_backup_devs;
 
     // Local key
-    uint64_t idx = ((laddr - heap_start) >> log2_cumem_granularity) * state->num_devices_initialized + dev_idx;
+    uint64_t idx = ((laddr - heap_start) >> log2_cumem_granularity) * total_devs + dev_idx;
     auto device_key = state->constmem.lkeys[idx];
     auto lchunk_size = device_key.next_addr - laddr;
     *lkey = device_key.key;
@@ -310,8 +321,8 @@ ibgda_get_lkey_and_rkey(uint64_t laddr, __be32* lkey, uint64_t raddr, int dst_pe
     // Remote key
     uint64_t roffset = raddr - heap_start;
 
-    idx = ((roffset >> log2_cumem_granularity) * nvshmemi_device_state_d.npes) * state->num_devices_initialized +
-        dst_pe * state->num_devices_initialized + dev_idx;
+    idx = ((roffset >> log2_cumem_granularity) * nvshmemi_device_state_d.npes) * total_devs +
+        dst_pe * total_devs + dev_idx;
     if (idx < NVSHMEMI_IBGDA_MAX_CONST_RKEYS) {
         device_key = state->constmem.rkeys[idx];
     } else {
@@ -328,10 +339,14 @@ ibgda_get_lkey_and_rkey(uint64_t laddr, __be32* lkey, uint64_t raddr, int dst_pe
 __device__ static __forceinline__ void ibgda_get_rkey(uint64_t addr, int dst_pe, uint64_t* out_raddr, __be32* out_rkey, uint32_t dev_idx) {
     auto state = ibgda_get_state();
     auto heap_start = reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base);
+    
+    // Total devices includes both primary and backup devices for FT lkey/rkey indexing
+    int num_backup_devs = state->ff ? state->ff->num_backup_devices : 0;
+    int total_devs = state->num_devices_initialized + num_backup_devs;
 
     uint64_t roffset = addr - heap_start;
-    uint64_t idx = ((roffset >> state->log2_cumem_granularity) * nvshmemi_device_state_d.npes * state->num_devices_initialized) +
-        dst_pe * state->num_devices_initialized + dev_idx;
+    uint64_t idx = ((roffset >> state->log2_cumem_granularity) * nvshmemi_device_state_d.npes * total_devs) +
+        dst_pe * total_devs + dev_idx;
     nvshmemi_ibgda_device_key_t device_key;
     if (idx < NVSHMEMI_IBGDA_MAX_CONST_RKEYS)
         device_key = state->constmem.rkeys[idx];
@@ -358,7 +373,7 @@ __device__ static __forceinline__ void nvshmemi_ibgda_rma_p(
     // NOTES: the `p` operation will not cross multiple remote chunks
     __be32 rkey;
     uint64_t raddr;
-    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    auto qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(dst_pe, qp_id) : ibgda_get_rc(dst_pe, qp_id);
     ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), dst_pe, &raddr, &rkey, qp->dev_idx);
 
     // Write WQEs
@@ -436,9 +451,13 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     uint64_t my_raddr = 0;
     uint64_t my_chunk_size = 0;
 
-    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    // Select QP: only fail over when the primary NIC for this QP is marked bad.
+    auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
+    auto qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
 
     // Decide how many messages (theoretically 3 for maximum)
+    const uint64_t req_rptr_back = req_rptr;
+    const uint64_t req_lptr_back = req_lptr;
     auto remaining_bytes = bytes;
     while (remaining_bytes > 0) {
         if (lane_id == num_wqes) {
@@ -471,40 +490,52 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     if (lane_id == 0)
         ibgda_submit_requests<kAlwaysDoPostSend>(qp, base_wqe_idx, num_wqes, message_idx);
     __syncwarp();
-    bool success = false;
-    if (lane_id == 0) {
-        auto state = ibgda_get_state();
-        const auto num_rc_per_pe = state->num_rc_per_pe;
-        uint32_t idx = dst_pe * num_rc_per_pe * state->num_devices_initialized + qp_id % (num_rc_per_pe * state->num_devices_initialized);
-        success = !nvshmemi_ibgda_use_backup_qp(idx, qp->tx_wq.cq);
+    // Blocking CQ check: healthy case exits quickly. Only if timeout and we were on primary,
+    // we switch this (dst_pe, qp_id) to backup and retry once.
+    bool need_backup = false;
+    if (lane_id == 0 and !deep_ep_ibgda_primary_is_bad()) {
+        // #region agent log
+        printf("DEADLOCK_HYP_G: put_nbi_warp before check_cq: dst_pe=%d, qp_id=%d, base_wqe_idx=%llu\n",
+               dst_pe, qp_id, base_wqe_idx + num_wqes);
+        // #endregion
+        need_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, base_wqe_idx + num_wqes, primary_qp->dev_idx);
+        // #region agent log
+        printf("DEADLOCK_HYP_G: put_nbi_warp after check_cq: need_backup=%d\n", need_backup);
+        // #endregion
     }
-    success = __shfl_sync(0xffffffff, success, 0);
+    need_backup = __shfl_sync(0xffffffff, need_backup, 0);
 
-    if (!success) {
-        if (lane_id == 0) {
-            printf("WARN: Timeout on primary QP for dst_pe=%d, qp_id=%d. Retrying with backup QP.\n", dst_pe, qp_id);
-        }
+    if (need_backup) {
+        __syncwarp();
+        num_wqes = 0;
+        my_lkey = 0;
+        my_laddr = 0;
+        my_rkey = 0;
+        my_raddr = 0;
+        my_chunk_size = 0;
 
-        auto state = ibgda_get_state();
-        const auto num_rc_per_pe = state->num_rc_per_pe;
-        uint32_t idx = dst_pe * num_rc_per_pe * state->num_devices_initialized + qp_id % (num_rc_per_pe * state->num_devices_initialized);
-        auto backup_qp = &state->ff->backup_rcs[idx];
+        auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
 
-        uint64_t initial_req_lptr = req_lptr - (bytes - remaining_bytes);
-        uint64_t initial_req_rptr = req_rptr - (bytes - remaining_bytes);
-
-        if (lane_id < num_wqes) {
-            uint64_t current_lptr = initial_req_lptr;
-            uint64_t current_rptr = initial_req_rptr;
-            size_t bytes_processed = 0;
-            for(int i=0; i<lane_id; ++i) {
-                uint64_t temp_chunk = min(bytes - bytes_processed, ibgda_get_lkey_and_rkey(current_lptr, &my_lkey, current_rptr, dst_pe, &my_raddr, &my_rkey, backup_qp->dev_idx));
-                current_lptr += temp_chunk;
-                current_rptr += temp_chunk;
-                bytes_processed += temp_chunk;
+        // Recompute message splitting for backup dev_idx (lkey/rkey may differ).
+        
+        uint64_t cur_rptr = req_rptr_back;
+        uint64_t cur_lptr = req_lptr_back;
+        auto remaining_bytes = bytes;
+        while (remaining_bytes > 0) {
+            if (lane_id == num_wqes) {
+                my_chunk_size = min(remaining_bytes,
+                                    ibgda_get_lkey_and_rkey(my_laddr = cur_lptr, &my_lkey, cur_rptr, dst_pe, &my_raddr, &my_rkey, backup_qp->dev_idx));
             }
-            my_chunk_size = min(bytes - bytes_processed, ibgda_get_lkey_and_rkey(my_laddr = current_lptr, &my_lkey, current_rptr, dst_pe, &my_raddr, &my_rkey, backup_qp->dev_idx));
+
+            // Move one more message
+            auto chunk_size = __shfl_sync(0xffffffff, my_chunk_size, static_cast<int>(num_wqes));
+            remaining_bytes -= chunk_size;
+            cur_lptr += chunk_size;
+            cur_rptr += chunk_size;
+            ++num_wqes;
         }
+        EP_DEVICE_ASSERT(num_wqes <= 32);
+
         uint64_t backup_base_wqe_idx = 0;
         if (lane_id == 0)
             backup_base_wqe_idx = ibgda_reserve_wqe_slots(backup_qp, num_wqes);
@@ -515,9 +546,23 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
             ibgda_write_rdma_write_wqe(backup_qp, my_laddr, my_lkey, my_raddr, my_rkey, my_chunk_size, wqe_idx, &wqe_ptr);
         }
         __syncwarp();
-
-        if (lane_id == 0)
+        if (lane_id == 0) {
+            printf("WARN: failover put_nbi_warp to backup dev_idx %u for primary dev_idx %u\n",
+               backup_qp->dev_idx, primary_qp->dev_idx);
             ibgda_submit_requests<kAlwaysDoPostSend>(backup_qp, backup_base_wqe_idx, num_wqes, message_idx);
+            // #region agent log
+            printf("DEADLOCK_HYP_N: put_nbi_warp after backup submit: backup_base_wqe_idx=%llu\n", backup_base_wqe_idx + num_wqes);
+            // #endregion
+            // Check backup QP CQ with timeout - if backup also fails, we can't do anything more
+            bool backup_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_base_wqe_idx + num_wqes, backup_qp->dev_idx);
+            if (backup_timeout) {
+                // #region agent log
+                printf("DEADLOCK_HYP_N: put_nbi_warp backup QP also timeout: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
+                // #endregion
+                // Backup QP also failed - mark as bad and continue (no more options)
+                // The barrier will handle timeout via nvshmemi_ibgda_quiet timeout check
+            }
+        }
         __syncwarp();
     }
 }
@@ -572,7 +617,8 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     if (is_local_copy) {
         atomicAdd(static_cast<unsigned long long*>(rptr), value);
     } else {
-        nvshmemi_ibgda_device_qp_t* qp = ibgda_get_rc(pe, qp_id);
+        nvshmemi_ibgda_device_qp_t* primary_qp = ibgda_get_rc(pe, qp_id);
+        nvshmemi_ibgda_device_qp_t* qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(pe, qp_id) : primary_qp;
 
         __be32 rkey;
         uint64_t raddr;
@@ -584,6 +630,29 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         ibgda_write_amo_add_wqe(qp, value, reinterpret_cast<uint64_t>(qp->ibuf.buf), qp->ibuf.lkey, raddr, rkey, my_wqe_idx, &wqe_ptrs);
 
         ibgda_submit_requests<true>(qp, my_wqe_idx, 1);
+        printf("DEADLOCK_HYP_S: dispatch nvshmemi_ibgda_amo_nonfetch_add exit, current use dev_idx=%u QP\n", qp->dev_idx);
+        // bool need_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, my_wqe_idx + 1, primary_qp->dev_idx);
+        // if (need_backup) {
+        //     nvshmemi_ibgda_device_qp_t* backup_qp = ibgda_get_backup_rc(pe, qp_id);
+
+        //     __be32 backup_rkey;
+        //     uint64_t backup_raddr;
+        //     ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), pe, &backup_raddr, &backup_rkey, backup_qp->dev_idx);
+
+        //     uint64_t backup_wqe_idx = ibgda_reserve_wqe_slots(backup_qp, 1);
+        //     void* backup_wqe_ptr = ibgda_get_wqe_ptr(backup_qp, backup_wqe_idx);
+
+        //     ibgda_write_amo_add_wqe(backup_qp,
+        //                             value,
+        //                             reinterpret_cast<uint64_t>(backup_qp->ibuf.buf),
+        //                             backup_qp->ibuf.lkey,
+        //                             backup_raddr,
+        //                             backup_rkey,
+        //                             backup_wqe_idx,
+        //                             &backup_wqe_ptr);
+
+        //     ibgda_submit_requests<true>(backup_qp, backup_wqe_idx, 1);
+        // }
     }
 }
 
@@ -617,9 +686,27 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
     // sure that if `idx - wqe_counter - 1 < ncqes`, `wqe_counter + 1 is less than
     // idx, and thus we need to wait. We don't need to wait when `idx == wqe_counter + 1`
     // That's why we use `- 2` here to make this case overflow.
+    // #region agent log
+    uint64_t poll_start = clock64();
+    constexpr uint64_t kPollTimeoutCycles = static_cast<uint64_t>(10.0 * 1.5e9); // 10 seconds
+    int poll_iter = 0;
+    // #endregion
     uint16_t wqe_counter;
     do {
         wqe_counter = HtoBE16(ld_na_relaxed(&cqe64->wqe_counter));
+        // #region agent log
+        if (++poll_iter % 1000000 == 0) {
+            uint64_t elapsed = clock64() - poll_start;
+            if (elapsed > kPollTimeoutCycles) {
+                printf("DEADLOCK_HYP_B: ibgda_poll_cq timeout: idx=%llu, wqe_counter=%u, cons_idx=%llu, elapsed=%llu cycles\n",
+                       idx, wqe_counter, *cq->cons_idx, elapsed);
+                // Mark primary as bad and return early to avoid infinite hang
+                atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad), 1u);
+                *cq->cons_idx = idx; // Update cons_idx to avoid re-entry
+                return;
+            }
+        }
+        // #endregion
     } while ((static_cast<uint16_t>(static_cast<uint16_t>(idx) - wqe_counter - static_cast<uint16_t>(2)) < ncqes));
     *cq->cons_idx = idx;
 
@@ -629,10 +716,34 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
 
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
-    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    // #region agent log
+    printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet entry: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
+    // #endregion
+    auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
+    auto qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
     auto state = ibgda_get_state();
     uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+    // #region agent log
+    printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet before poll: prod_idx=%llu, primary_bad=%d, using_qp_dev_idx=%u\n", 
+           prod_idx, deep_ep_ibgda_primary_is_bad(), qp->dev_idx);
+    // #endregion
+    // Avoid infinite hang if NIC is down: timeout triggers early return.
+    // Use the current QP's dev_idx (could be backup if primary is bad)
+    bool qp_timeout = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, prod_idx, qp->dev_idx);
+    if (qp_timeout) {
+        // #region agent log
+        printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet timeout detected (qp_dev_idx=%u), skipping CQ wait: dst_pe=%d, qp_id=%d\n", 
+               qp->dev_idx, dst_pe, qp_id);
+        // #endregion
+        // If timeout, just return without waiting. This prevents infinite hang in barrier.
+        // If primary was bad and backup also times out, we have no more options - just return.
+        return;
+    }
+    // Success path: keep original semantics.
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+    // #region agent log
+    printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet exit: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
+    // #endregion
 }
 
 }  // namespace deep_ep
