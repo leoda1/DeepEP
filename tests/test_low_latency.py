@@ -75,8 +75,15 @@ def test_main(num_tokens: int,
     for _ in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
-    all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
-    dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
+    # all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
+    # dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
+
+    topk_idx_cpu = topk_idx.cpu()
+    glooGp =dist.new_group(backend='gloo')
+    all_topk_idx_cpu_flat = torch.empty((num_ranks * num_tokens, num_topk), dtype=topk_idx_cpu.dtype, device='cpu')
+    dist.all_gather_into_tensor(all_topk_idx_cpu_flat, topk_idx_cpu, group=glooGp)
+    all_topk_idx_cpu = all_topk_idx_cpu_flat.view(num_ranks, num_tokens, num_topk)
+    all_topk_idx = all_topk_idx_cpu.to(device='cuda')
 
     # For failure simulation and shrink testing
     mask_status = torch.zeros((num_ranks, ), dtype=torch.int, device='cuda')
@@ -226,12 +233,12 @@ def test_main(num_tokens: int,
         num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
 
     # Dispatch + combine testing
-    # avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
+    avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
     if skip_combine:
-        # print(
-        #     f'[rank {rank}] Dispatch only bandwidth: {num_dispatch_comm_bytes / 1e9 / avg_t:.2f} GB/s, '
-        #     f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us',
-        #     flush=True)
+        print(
+            f'[rank {rank}] Dispatch only bandwidth: {num_dispatch_comm_bytes / 1e9 / avg_t:.2f} GB/s, '
+            f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us',
+            flush=True)
         pass
     else:
         print(
@@ -338,7 +345,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()
-    dist.barrier()
+    # dist.barrier()
     dist.destroy_process_group()
 
 

@@ -59,7 +59,7 @@ __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, 
                 ;
             // Mask rank if timeout
             if (wait_recv_cost > NUM_TIMEOUT_CYCLES) {
-                printf("Warning: DeepEP timeout for barrier, rank %d, dst_rank %d\n", rank, dst_rank);
+                // printf("Warning: DeepEP timeout for barrier, rank %d, dst_rank %d\n", rank, dst_rank);
                 if (mask_buffer_ptr == nullptr)
                     trap();
                 atomicExch(mask_buffer_ptr + dst_rank, 1);
@@ -165,9 +165,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
     
     // #region agent log
-    if (sm_id == 0 && thread_id == 0) {
-        printf("DEADLOCK_HYP_H: dispatch kernel entry: phases=%d, num_sms=%d, num_tokens=%d\n", phases, num_sms, num_tokens);
-    }
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("DEADLOCK_HYP_H: dispatch kernel entry: phases=%d, num_sms=%d, num_tokens=%d\n", phases, num_sms, num_tokens);
+    // }
     // #endregion
 
     // May extract UE8M0 from the scales
@@ -194,9 +194,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
 
     // Sending phase
     // #region agent log
-    if (sm_id == 0 && thread_id == 0) {
-        printf("DEADLOCK_HYP_J: dispatch checking send phase: phases=%d, has_send=%d\n", phases, (phases & LOW_LATENCY_SEND_PHASE) != 0);
-    }
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("DEADLOCK_HYP_J: dispatch checking send phase: phases=%d, has_send=%d\n", phases, (phases & LOW_LATENCY_SEND_PHASE) != 0);
+    // }
     // #endregion
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_DISPATCH_RECV;
@@ -274,24 +274,24 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + slot_idx * num_bytes_per_msg;
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 // #region agent log
-                if (lane_id == 0 && sm_id == 0) {
-                    printf("DEADLOCK_HYP_E: dispatch send before put_nbi: token_idx=%d, dst_rank=%d, dst_expert_idx=%d, masked=%d\n",
-                        token_idx, dst_rank, dst_expert_idx, is_rank_masked<true>(mask_buffer_ptr, dst_rank));
-                }
+                // if (lane_id == 0 && sm_id == 0) {
+                //     printf("DEADLOCK_HYP_E: dispatch send before put_nbi: token_idx=%d, dst_rank=%d, dst_expert_idx=%d, masked=%d\n",
+                //         token_idx, dst_rank, dst_expert_idx, is_rank_masked<true>(mask_buffer_ptr, dst_rank));
+                // }
                 // #endregion
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
                         // #region agent log
-                        if (lane_id == 0 && sm_id == 0) {
-                            printf("DEADLOCK_HYP_E: dispatch send calling put_nbi_warp: dst_rank=%d\n", dst_rank);
-                        }
+                        // if (lane_id == 0 && sm_id == 0) {
+                        //     printf("DEADLOCK_HYP_E: dispatch send calling put_nbi_warp: dst_rank=%d\n", dst_rank);
+                        // }
                         // #endregion
                         nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                         // sm_id == 0 ? printf("[1]sm_id run into put_nbi == 0\n") : 0;
                         // #region agent log
-                        if (lane_id == 0 && sm_id == 0) {
-                            printf("DEADLOCK_HYP_E: dispatch send after put_nbi_warp: dst_rank=%d\n", dst_rank);
-                        }
+                        // if (lane_id == 0 && sm_id == 0) {
+                        //     printf("DEADLOCK_HYP_E: dispatch send after put_nbi_warp: dst_rank=%d\n", dst_rank);
+                        // }
                         // #endregion
                     } else {
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
@@ -350,15 +350,15 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         }
     }
     // #region agent log
-    if (sm_id == 0 && thread_id == 0) {
-        printf("DEADLOCK_HYP_K: dispatch before __syncthreads after send phase\n");
-    }
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("DEADLOCK_HYP_K: dispatch before __syncthreads after send phase\n");
+    // }
     // #endregion
     __syncthreads();
     // #region agent log
-    if (sm_id == 0 && thread_id == 0) {
-        printf("DEADLOCK_HYP_K: dispatch after __syncthreads after send phase\n");
-    }
+    // if (sm_id == 0 && thread_id == 0) {
+    //     printf("DEADLOCK_HYP_K: dispatch after __syncthreads after send phase\n");
+    // }
     // #endregion
 
     // Issue count sends
@@ -369,14 +369,24 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups];
 
         // Wait local sends issued and send expert counts
-        while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
+        auto start_time = clock64();
+        uint64_t wait_recv_cost = 0;
+        int wait_iter = 0;
+        while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2 and 
+            (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES) {
+            // if (++wait_iter % 10000000 == 0) {
+            //     printf("DEADLOCK_HYP_M: dispatch after wait local sends issued and send expert counts: responsible_expert_idx=%d, num_tokens_sent=%d\n", responsible_expert_idx, num_tokens_sent);
+            // }
             ;
+        }
+        
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
         auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
                 // sm_id == 0 ? printf("[3]sm_id0 run into amo ope\n") : 0;
                 nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+                // printf("DEADLOCK_HYP_N: dispatch after nvshmemi_ibgda_amo_nonfetch_add: dst_rank=%d, dst_expert_local_idx=%d\n", dst_rank, dst_expert_local_idx);
             } else {
                 st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
                 // sm_id == 0 ? printf("[4]sm_id0 not run into amo ope\n") : 0;
@@ -392,8 +402,6 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             packed_recv_count[dst_expert_local_idx] = 0;
     }
     __syncwarp();
-
-
 // Receiving phase
 LOW_LATENCY_DISPATCH_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
@@ -401,17 +409,10 @@ LOW_LATENCY_DISPATCH_RECV:
 
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & LOW_LATENCY_SEND_PHASE) {
-        // #region agent log
-        if (sm_id == 0 && thread_id == 0) {
-            printf("DEADLOCK_HYP_I: dispatch before grid sync (send->recv transition)\n");
-        }
-        // #endregion
         cg::this_grid().sync();
-        // #region agent log
-        if (sm_id == 0 && thread_id == 0) {
-            printf("DEADLOCK_HYP_I: dispatch after grid sync (send->recv transition)\n");
-        }
-        // #endregion
+        // if (sm_id == 0 && thread_id == 0) {
+        //     printf("DEADLOCK_HYP_I: dispatch after grid sync (send->recv transition)\n");
+        // }
     }
 
     // Receiving and packing
@@ -437,25 +438,22 @@ LOW_LATENCY_DISPATCH_RECV:
         int num_recv_tokens = 0, recv_token_begin_idx;
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 15);
         if (sub_warp_id == 1 and lane_id == 0) {
-            // #region agent log
-            printf("DEADLOCK_HYP_F: dispatch recv entry: src_rank=%d, local_expert_idx=%d, masked=%d\n",
-                   src_rank, local_expert_idx, is_rank_masked(mask_buffer_ptr, src_rank));
-            // #endregion
             auto start_time = clock64();
             uint64_t wait_recv_cost = 0;
             if (not is_rank_masked(mask_buffer_ptr, src_rank)) {
-                printf("Debug: Waiting for tokens from src_rank %d\n", src_rank);
+                // printf("Debug: Waiting for tokens from src_rank %d\n", src_rank);
                 int wait_iter = 0;
                 while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) ==
                            0                                                               // data not arrived
                        && (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES  // not timeout
                 ) {
                     // #region agent log
-                    if (++wait_iter % 10000000 == 0) {
-                        printf("DEADLOCK_HYP_F: dispatch recv waiting: src_rank=%d, wait_cost=%llu cycles, iter=%d\n",
-                               src_rank, wait_recv_cost, wait_iter);
-                    }
+                    // if (++wait_iter % 10000000 == 0) {
+                    //     printf("DEADLOCK_HYP_F: dispatch recv waiting: src_rank=%d, wait_cost=%llu cycles, iter=%d\n",
+                    //            src_rank, wait_recv_cost, wait_iter);
+                    // }
                     // #endregion
+                    ;
                 }
             }
             // Do not receive tokens if rank timeout or masked
@@ -463,25 +461,25 @@ LOW_LATENCY_DISPATCH_RECV:
                 num_recv_tokens = -1;
             // Mask rank if timeout
             if (wait_recv_cost > NUM_TIMEOUT_CYCLES) {
-                printf("Warning: DeepEP timeout for dispatch receive, rank %d, local_expert_idx %d, src_rank %d\n",
-                       rank,
-                       local_expert_idx,
-                       src_rank);
+                // printf("Warning: DeepEP timeout for dispatch receive, rank %d, local_expert_idx %d, src_rank %d\n",
+                //        rank,
+                //        local_expert_idx,
+                //        src_rank);
                 if (mask_buffer_ptr == nullptr)
                     trap();
                 atomicExch(mask_buffer_ptr + src_rank, 1);
                 // #region agent log
-                printf("DEADLOCK_HYP_O: dispatch recv timeout handled: rank=%d, src_rank=%d, num_recv_tokens=%d\n",
-                       rank, src_rank, num_recv_tokens);
+                // printf("DEADLOCK_HYP_O: dispatch recv timeout handled: rank=%d, src_rank=%d, num_recv_tokens=%d\n",
+                //        rank, src_rank, num_recv_tokens);
                 // #endregion
             }
 
             num_recv_tokens = -num_recv_tokens - 1;
             // #region agent log
-            if (num_recv_tokens < 0) {
-                printf("DEADLOCK_HYP_O: dispatch recv setting negative tokens: rank=%d, src_rank=%d, num_recv_tokens=%d\n",
-                       rank, src_rank, num_recv_tokens);
-            }
+            // if (num_recv_tokens < 0) {
+            //     printf("DEADLOCK_HYP_O: dispatch recv setting negative tokens: rank=%d, src_rank=%d, num_recv_tokens=%d\n",
+            //            rank, src_rank, num_recv_tokens);
+            // }
             // #endregion
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -494,28 +492,12 @@ LOW_LATENCY_DISPATCH_RECV:
             if (dispatch_wait_recv_cost_stats != nullptr)
                 atomicAdd(reinterpret_cast<unsigned long long*>(dispatch_wait_recv_cost_stats + src_rank), wait_recv_cost);
         }
-        // #region agent log
-        if (sm_id == 0 && responsible_expert_idx < num_experts && sub_warp_id == 1 && lane_id == 0) {
-            printf("DEADLOCK_HYP_P: dispatch recv before bar.sync: warp_group_id=%d, num_recv_tokens=%d\n",
-                   warp_group_id, shared_num_recv_tokens[warp_group_id]);
-        }
-        // #endregion
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 2), "r"(num_warps_per_group * 32));
-        // #region agent log
-        if (sm_id == 0 && responsible_expert_idx < num_experts && sub_warp_id == 1 && lane_id == 0) {
-            printf("DEADLOCK_HYP_P: dispatch recv after bar.sync: warp_group_id=%d\n", warp_group_id);
-        }
-        // #endregion
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
-        // #region agent log
-        if (sm_id == 0 && responsible_expert_idx < num_experts && sub_warp_id == 0 && lane_id == 0) {
-            printf("DEADLOCK_HYP_Q: dispatch recv before copy loop: num_recv_tokens=%d\n", num_recv_tokens);
-        }
-        // #endregion
         for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
@@ -553,9 +535,9 @@ LOW_LATENCY_DISPATCH_RECV:
             }
         }
         // #region agent log
-        if (sm_id == 0 && responsible_expert_idx < num_experts && sub_warp_id == 0 && lane_id == 0) {
-            printf("DEADLOCK_HYP_R: dispatch kernel exit: responsible_expert_idx=%d\n", responsible_expert_idx);
-        }
+        // if (sm_id == 0 && responsible_expert_idx < num_experts && sub_warp_id == 0 && lane_id == 0) {
+        //     printf("DEADLOCK_HYP_R: dispatch kernel exit: responsible_expert_idx=%d\n", responsible_expert_idx);
+        // }
     }
 }
 
@@ -1057,10 +1039,10 @@ LOW_LATENCY_COMBINE_RECV:
             }
             // Mask rank if timeout
             if (wait_recv_cost > NUM_TIMEOUT_CYCLES) {
-                printf("Warning: DeepEP timeout for combine receive, rank %d, local_expert_idx %d, src_rank %d\n",
-                       rank,
-                       responsible_expert_idx % num_local_experts,
-                       src_rank);
+                // printf("Warning: DeepEP timeout for combine receive, rank %d, local_expert_idx %d, src_rank %d\n",
+                //        rank,
+                //        responsible_expert_idx % num_local_experts,
+                //        src_rank);
                 if (mask_buffer_ptr == nullptr)
                     trap();
                 atomicExch(mask_buffer_ptr + src_rank, 1);
