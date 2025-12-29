@@ -10,7 +10,9 @@
 #include "configs.cuh"
 #include "exception.cuh"
 #include "utils.cuh"
-
+#ifndef DEEP_EP_MAX_PES
+#define DEEP_EP_MAX_PES 256
+#endif
 namespace deep_ep {
 
 EP_STATIC_ASSERT(NVSHMEMI_IBGDA_MIN_QP_DEPTH >= 64, "Invalid QP minimum depth");
@@ -151,6 +153,24 @@ __device__ static __forceinline__ void ibgda_post_send(nvshmemi_ibgda_device_qp_
 
     old_prod_idx = atomicMax(reinterpret_cast<unsigned long long int*>(&mvars->tx_wq.prod_idx), new_prod_idx);
     if (new_prod_idx > old_prod_idx) {
+        // #region agent log
+        bool is_backup = (qp->dev_idx >= ibgda_get_state()->num_devices_initialized);
+        if (is_backup) {
+            printf("DOORBELL_BACKUP: srcRank=%d, qpn=%u dev_idx=%u GID=%04llx:%04llx:%04llx:%04llx:%04llx:%04llx:%04llx:%04llx old_prod_idx=%llu new_prod_idx=%llu dbrec=%p bf=%p\n",
+                   nvshmemi_device_state_d.mype,
+                    qp->qpn, qp->dev_idx,
+                   (unsigned long long)((qp->spn >> 48) & 0xFFFF),
+                   (unsigned long long)((qp->spn >> 32) & 0xFFFF),
+                   (unsigned long long)((qp->spn >> 16) & 0xFFFF),
+                   (unsigned long long)(qp->spn & 0xFFFF),
+                   (unsigned long long)((qp->iid >> 48) & 0xFFFF),
+                   (unsigned long long)((qp->iid >> 32) & 0xFFFF),
+                   (unsigned long long)((qp->iid >> 16) & 0xFFFF),
+                   (unsigned long long)(qp->iid & 0xFFFF),
+                   (unsigned long long)old_prod_idx, (unsigned long long)new_prod_idx,
+                   qp->tx_wq.dbrec, qp->tx_wq.bf);
+        }
+        // #endregion
         ibgda_update_dbr(qp, new_prod_idx);
         ibgda_ring_db(qp, new_prod_idx);
     }
@@ -175,7 +195,7 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     // Wait for prior WQE slots to be filled first
     // #region agent log
     uint64_t submit_wait_start = clock64();
-    constexpr uint64_t kSubmitTimeoutCycles = static_cast<uint64_t>(10.0 * 1.5e9); // 10 seconds
+    constexpr uint64_t kSubmitTimeoutCycles = static_cast<uint64_t>(10.0 * 1.5e9); // 15 seconds
     int submit_wait_iter = 0;
     // #endregion
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx) {
@@ -194,8 +214,20 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     // Always post, not in batch
     if (!state->use_async_postsend) {
         constexpr int kNumRequestInBatch = 4;
-        if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
+        if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0) {
+            // #region agent log
+            bool is_backup = (qp->dev_idx >= state->num_devices_initialized);
+            if (is_backup && kAlwaysDoPostSend) {
+                uint64_t prod_idx_val = state->use_async_postsend ? 
+                    ld_na_relaxed(qp->tx_wq.prod_idx) : qp->mvars.tx_wq.prod_idx;
+                printf("SUBMIT_BACKUP: qpn=%u dev_idx=%u new_wqe_idx=%llu ready_head=%llu prod_idx=%llu\n",
+                       qp->qpn, qp->dev_idx, (unsigned long long)new_wqe_idx,
+                       (unsigned long long)mvars->tx_wq.ready_head,
+                       (unsigned long long)prod_idx_val);
+            }
+            // #endregion
             ibgda_post_send(qp, new_wqe_idx);
+        }
     }
 }
 
@@ -226,10 +258,27 @@ __device__ static __forceinline__ bool ibgda_cq_completed(nvshmemi_ibgda_device_
 #define MLX5_CQE_OWNER_MASK 0x01
 
 
-static __device__ uint32_t deep_ep_ibgda_primary_bad = 0;
+// Per-PE primary QP bad flag: deep_ep_ibgda_primary_bad[pe] indicates if primary QP to that PE is bad
+// Maximum 32 PEs supported (using uint32_t bitmask would be more efficient but array is simpler)
+static __device__ uint32_t deep_ep_ibgda_primary_bad[32] = {0};
 
+__device__ static __forceinline__ bool deep_ep_ibgda_primary_is_bad(int pe) {
+    if (pe < 0 || pe >= 32) {
+        printf("deep_ep_ibgda_primary_is_bad: pe=%d is out of range\n", pe);
+        return false;  // Safety check
+    }
+    return ld_na_relaxed(&deep_ep_ibgda_primary_bad[pe]) != 0;
+}
+
+// Legacy function for backward compatibility - checks all PEs (should not be used)
 __device__ static __forceinline__ bool deep_ep_ibgda_primary_is_bad() {
-    return ld_na_relaxed(&deep_ep_ibgda_primary_bad) != 0;
+    // Check if any PE is marked bad (for legacy code that doesn't pass pe)
+    for (int i = 0; i < 32; i++) {
+        if (ld_na_relaxed(&deep_ep_ibgda_primary_bad[i]) != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Check if WQE completed, blocking wait with timeout.
@@ -237,17 +286,24 @@ __device__ static __forceinline__ bool deep_ep_ibgda_primary_is_bad() {
 // This is designed for "fast exit" in healthy case: it polls with a small backoff.
 __device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_device_cq_t* cq,
                                                                uint64_t expected_wqe_idx,
-                                                               uint32_t /*primary_dev_idx*/) {
+                                                               uint32_t /*primary_dev_idx*/,
+                                                               int target_pe = -1) {
     if (cq == nullptr || cq->cqe == nullptr) {
+        // #region agent log
+        printf("CQ_CHECK_NULL: cq=%p cqe=%p expected_wqe_idx=%llu\n",
+               cq, cq ? cq->cqe : nullptr, (unsigned long long)expected_wqe_idx);
+        // #endregion
         return true;  // No CQ = failure
     }
-    constexpr uint64_t kTimeoutCycles = static_cast<uint64_t>(5.0 * 1.5e9);
+    constexpr uint64_t kTimeoutCycles = static_cast<uint64_t>(10.0 * 1.5e9);
     constexpr int kSpinIters = 256;  // quick spins before backoff
     uint64_t start_time = ibgda_get_clock_cycles();
 
     // We follow NVSHMEM semantics: compare against (wqe_idx + 1).
     const uint64_t idx = expected_wqe_idx;
     int spins = 0;
+    uint64_t last_cons_idx = *cq->cons_idx;
+    uint16_t last_wqe_counter = 0;
     do {
         if (ibgda_cq_completed(cq, idx)) return false;  // Completed successfully
 
@@ -255,11 +311,40 @@ __device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_de
         if (++spins > kSpinIters) {
             __nanosleep(64);
             spins = 0;
+            // #region agent log
+            uint64_t curr_cons_idx = *cq->cons_idx;
+            uint16_t wqe_counter = HtoBE16(ld_na_relaxed(&static_cast<mlx5_cqe64*>(cq->cqe)->wqe_counter));
+            if (curr_cons_idx != last_cons_idx || wqe_counter != last_wqe_counter) {
+                printf("CQ_CHECK_PROGRESS: expected=%llu cons_idx=%llu->%llu wqe_counter=%u->%u elapsed=%llu\n",
+                       (unsigned long long)idx, (unsigned long long)last_cons_idx, (unsigned long long)curr_cons_idx,
+                       last_wqe_counter, wqe_counter, ibgda_get_clock_cycles() - start_time);
+                last_cons_idx = curr_cons_idx;
+                last_wqe_counter = wqe_counter;
+            }
+            // #endregion
         }
 
         if ((ibgda_get_clock_cycles() - start_time) > kTimeoutCycles) {
-            // Sticky failover: mark primary as bad globally.
-            atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad), 1u);
+            // #region agent log
+            uint64_t final_cons_idx = *cq->cons_idx;
+            uint16_t final_wqe_counter = HtoBE16(ld_na_relaxed(&static_cast<mlx5_cqe64*>(cq->cqe)->wqe_counter));
+            printf("CQ_CHECK_TIMEOUT: expected=%llu final_cons_idx=%llu final_wqe_counter=%u elapsed=%llu\n",
+                   (unsigned long long)idx, (unsigned long long)final_cons_idx, final_wqe_counter,
+                   ibgda_get_clock_cycles() - start_time);
+            // #endregion
+            // Sticky failover: mark primary as bad for this specific PE.
+            if (target_pe >= 0 && target_pe < 32) {
+                uint32_t old_val = atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad[target_pe]), 1u);
+                // #region agent log
+                printf("CQ_CHECK_TIMEOUT_MARK: rank=%d target_pe=%d old_val=%u new_val=1\n",
+                       nvshmemi_device_state_d.mype, target_pe, old_val);
+                // #endregion
+            } else {
+                // #region agent log
+                printf("CQ_CHECK_TIMEOUT_MARK_FAILED: rank=%d target_pe=%d (invalid, not marking)\n",
+                       nvshmemi_device_state_d.mype, target_pe);
+                // #endregion
+            }
             return true;  // Timeout = failure
         }
     } while (true);
@@ -373,7 +458,7 @@ __device__ static __forceinline__ void nvshmemi_ibgda_rma_p(
     // NOTES: the `p` operation will not cross multiple remote chunks
     __be32 rkey;
     uint64_t raddr;
-    auto qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(dst_pe, qp_id) : ibgda_get_rc(dst_pe, qp_id);
+    auto qp = deep_ep_ibgda_primary_is_bad(dst_pe) ? ibgda_get_backup_rc(dst_pe, qp_id) : ibgda_get_rc(dst_pe, qp_id);
     ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), dst_pe, &raddr, &rkey, qp->dev_idx);
 
     // Write WQEs
@@ -385,7 +470,7 @@ __device__ static __forceinline__ void nvshmemi_ibgda_rma_p(
     // Submit requests
     ibgda_submit_requests<true>(qp, base_wqe_idx, 1);
 
-    bool use_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, base_wqe_idx, qp->dev_idx);
+    bool use_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, base_wqe_idx, qp->dev_idx, dst_pe);
     if (use_backup) {
         auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
         ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), dst_pe, &raddr, &rkey, backup_qp->dev_idx);
@@ -464,7 +549,7 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
 
     // Select QP: only fail over when the primary NIC for this QP is marked bad.
     auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
-    auto qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
+    auto qp = deep_ep_ibgda_primary_is_bad(dst_pe) ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
 
     // Decide how many messages (theoretically 3 for maximum)
     const uint64_t req_rptr_back = req_rptr;
@@ -504,12 +589,12 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     // Blocking CQ check: healthy case exits quickly. Only if timeout and we were on primary,
     // we switch this (dst_pe, qp_id) to backup and retry once.
     bool need_backup = false;
-    if (lane_id == 0 and !deep_ep_ibgda_primary_is_bad()) {
+    if (lane_id == 0 and !deep_ep_ibgda_primary_is_bad(dst_pe)) {
         // #region agent log
         // printf("DEADLOCK_HYP_G: put_nbi_warp before check_cq: dst_pe=%d, qp_id=%d, base_wqe_idx=%llu\n",
         //        dst_pe, qp_id, base_wqe_idx + num_wqes);
         // #endregion
-        need_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, base_wqe_idx + num_wqes, primary_qp->dev_idx);
+        need_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, base_wqe_idx + num_wqes, primary_qp->dev_idx, dst_pe);
         // #region agent log
         // printf("DEADLOCK_HYP_G: put_nbi_warp after check_cq: need_backup=%d\n", need_backup);
         // // #endregion
@@ -558,21 +643,21 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
         }
         __syncwarp();
         if (lane_id == 0) {
-            // printf("WARN: failover put_nbi_warp to backup dev_idx %u for primary dev_idx %u\n",
-            //    backup_qp->dev_idx, primary_qp->dev_idx);
+            printf("WARN: failover put_nbi_warp to backup dev_idx %u for primary dev_idx %u\n",
+               backup_qp->dev_idx, primary_qp->dev_idx);
             ibgda_submit_requests<kAlwaysDoPostSend>(backup_qp, backup_base_wqe_idx, num_wqes, message_idx);
             // #region agent log
             // printf("DEADLOCK_HYP_N: put_nbi_warp after backup submit: backup_base_wqe_idx=%llu\n", backup_base_wqe_idx + num_wqes);
             // #endregion
             // Check backup QP CQ with timeout - if backup also fails, we can't do anything more
-            bool backup_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_base_wqe_idx + num_wqes, backup_qp->dev_idx);
-            // if (backup_timeout) {
+            bool backup_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_base_wqe_idx + num_wqes, backup_qp->dev_idx, dst_pe);
+            if (backup_timeout) {
                 // #region agent log
-                // printf("DEADLOCK_HYP_N: put_nbi_warp backup QP also timeout: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
+                printf("DEADLOCK_HYP_N: put_nbi_warp backup QP also timeout: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
                 // #endregion
                 // Backup QP also failed - mark as bad and continue (no more options)
                 // The barrier will handle timeout via nvshmemi_ibgda_quiet timeout check
-            // }
+            }
         }
         __syncwarp();
     }
@@ -631,7 +716,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     } else {
         nvshmemi_ibgda_device_qp_t* primary_qp = ibgda_get_rc(pe, qp_id);
         __threadfence();
-        nvshmemi_ibgda_device_qp_t* qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(pe, qp_id) : primary_qp;
+        nvshmemi_ibgda_device_qp_t* qp = deep_ep_ibgda_primary_is_bad(pe) ? ibgda_get_backup_rc(pe, qp_id) : primary_qp;
 
         __be32 rkey;
         uint64_t raddr;
@@ -643,6 +728,19 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         ibgda_write_amo_add_wqe(qp, value, reinterpret_cast<uint64_t>(qp->ibuf.buf), qp->ibuf.lkey, raddr, rkey, my_wqe_idx, &wqe_ptrs);
 
         ibgda_submit_requests<true>(qp, my_wqe_idx, 1);
+        // printf("AMO_PRIMARY_PATH: rank=%d pe=%d qp_id=%d qpn=%u dev_idx=%u GID=%04llx:%04llx:%04llx:%04llx:%04llx:%04llx:%04llx:%04llx wqe=%llu cq=%p cqe=%p cons_idx=%llu\n",
+        //     nvshmemi_device_state_d.mype, pe, qp_id, qp->qpn, qp->dev_idx,
+        //     (unsigned long long)((qp->spn >> 48) & 0xFFFF),
+        //     (unsigned long long)((qp->spn >> 32) & 0xFFFF),
+        //     (unsigned long long)((qp->spn >> 16) & 0xFFFF),
+        //     (unsigned long long)(qp->spn & 0xFFFF),
+        //     (unsigned long long)((qp->iid >> 48) & 0xFFFF),
+        //     (unsigned long long)((qp->iid >> 32) & 0xFFFF),
+        //     (unsigned long long)((qp->iid >> 16) & 0xFFFF),
+        //     (unsigned long long)(qp->iid & 0xFFFF),
+        //     (unsigned long long)(my_wqe_idx + 1), qp->tx_wq.cq,
+        //     qp->tx_wq.cq ? qp->tx_wq.cq->cqe : nullptr,
+        //     qp->tx_wq.cq ? (unsigned long long)*qp->tx_wq.cq->cons_idx : 0);
         
         // Check CQ completion: if using primary QP and it fails, failover to backup QP
         // If already using backup QP, just check backup QP's CQ
@@ -650,7 +748,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         bool need_backup = false;
         if (!is_using_backup) {
             // Using primary QP: check primary CQ, failover if timeout
-            need_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, my_wqe_idx + 1, primary_qp->dev_idx);
+            need_backup = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, my_wqe_idx + 1, primary_qp->dev_idx, pe);
             // #region agent log
             // printf("BUG_CHECK_J: AMO primary check_cq: need_backup=%d\n", need_backup);
             // #endregion
@@ -658,7 +756,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         
         if (need_backup) {
             nvshmemi_ibgda_device_qp_t* backup_qp = ibgda_get_backup_rc(pe, qp_id);
-            // printf("DEADLOCK_HYP_N: nvshmemi_ibgda_amo_nonfetch_add backup qp: dev_idx=%u\n", backup_qp->dev_idx);
+            printf("DEADLOCK_HYP_N: nvshmemi_ibgda_amo_nonfetch_add backup qp: dev_idx=%u\n", backup_qp->dev_idx);
 
             __be32 backup_rkey;
             uint64_t backup_raddr;
@@ -678,36 +776,45 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
 
             ibgda_submit_requests<true>(backup_qp, backup_wqe_idx, 1);
             // #region agent log
-            // printf("BUG_CHECK_L: AMO backup submit: backup_qp->tx_wq.cq=%p, backup_wqe_idx=%llu\n",
-                //    backup_qp->tx_wq.cq, backup_wqe_idx + 1);
+            printf("BUG_CHECK_L: AMO backup submit: backup_qp->tx_wq.cq=%p, backup_wqe_idx=%llu\n",
+                   backup_qp->tx_wq.cq, backup_wqe_idx + 1);
             // #endregion
             // Check backup QP CQ completion - CRITICAL: without this, receiver will hang waiting for rdma_recv_count
-            bool backup_amo_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_wqe_idx + 1, backup_qp->dev_idx);
+            bool backup_amo_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_wqe_idx + 1, backup_qp->dev_idx, pe);
             // #region agent log
             // printf("BUG_CHECK_M: AMO backup check_cq result: backup_amo_timeout=%d\n", backup_amo_timeout);
             // #endregion
             if (backup_amo_timeout) {
                 // #region agent log
-                // printf("BUG_CHECK_N: AMO backup QP also timeout: pe=%d, qp_id=%d\n", pe, qp_id);
+                printf("BUG_CHECK_N: AMO backup QP also timeout: pe=%d, qp_id=%d\n", pe, qp_id);
                 // #endregion
                 // Backup QP also failed - mark as bad and continue (no more options)
             }
         } else if (is_using_backup) {
-            // Already using backup QP: check backup QP's CQ directly
+            // Already on backup QP: verify its CQ
             // #region agent log
-            // printf("BUG_CHECK_O: AMO already using backup, check backup CQ: qp->tx_wq.cq=%p, my_wqe_idx=%llu, qp->dev_idx=%u\n",
-            //        qp->tx_wq.cq, my_wqe_idx + 1, qp->dev_idx);
-            // #endregion
-            bool backup_timeout = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, my_wqe_idx + 1, qp->dev_idx);
-            // #region agent log
-            // printf("BUG_CHECK_P: AMO backup CQ check result: backup_timeout=%d\n", backup_timeout);
-            // #endregion
-            // if (backup_timeout) {
+            auto state = ibgda_get_state();
+            uint64_t prod_idx_before = state->use_async_postsend ? 
+            ld_na_relaxed(qp->tx_wq.prod_idx) : qp->mvars.tx_wq.prod_idx;
+            printf("AMO_BACKUP_PATH_TIMEOUT: rank=%d pe=%d qp_id=%d qpn=%u dev_idx=%u GID=%04llx:%04llx:%04llx:%04llx:%04llx:%04llx:%04llx:%04llx wqe=%llu cq=%p cqe=%p cons_idx=%llu\n",
+                   nvshmemi_device_state_d.mype, pe, qp_id, qp->qpn, qp->dev_idx,
+                   (unsigned long long)((qp->spn >> 48) & 0xFFFF),
+                   (unsigned long long)((qp->spn >> 32) & 0xFFFF),
+                   (unsigned long long)((qp->spn >> 16) & 0xFFFF),
+                   (unsigned long long)(qp->spn & 0xFFFF),
+                   (unsigned long long)((qp->iid >> 48) & 0xFFFF),
+                   (unsigned long long)((qp->iid >> 32) & 0xFFFF),
+                   (unsigned long long)((qp->iid >> 16) & 0xFFFF),
+                   (unsigned long long)(qp->iid & 0xFFFF),
+                   (unsigned long long)(my_wqe_idx + 1), qp->tx_wq.cq,
+                   qp->tx_wq.cq ? qp->tx_wq.cq->cqe : nullptr,
+                   qp->tx_wq.cq ? (unsigned long long)*qp->tx_wq.cq->cons_idx : 0);
+            bool backup_timeout = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, my_wqe_idx + 1, qp->dev_idx, pe);
+            if (backup_timeout) {
                 // #region agent log
-                // printf("BUG_CHECK_Q: AMO backup QP timeout: pe=%d, qp_id=%d\n", pe, qp_id);
+                printf("BUG_CHECK_O: AMO backup QP also timeout: pe=%d, qp_id=%d\n", pe, qp_id);
                 // #endregion
-                // Backup QP failed - no more options
-            // }
+            }
         }
     }
 }
@@ -756,8 +863,8 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
             if (elapsed > kPollTimeoutCycles) {
                 printf("DEADLOCK_HYP_B: ibgda_poll_cq timeout: idx=%llu, wqe_counter=%u, cons_idx=%llu, elapsed=%llu cycles\n",
                        idx, wqe_counter, *cq->cons_idx, elapsed);
-                // Mark primary as bad and return early to avoid infinite hang
-                atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad), 1u);
+                // Note: ibgda_poll_cq doesn't know which PE this CQ belongs to, so we can't mark it per-PE here
+                // The per-PE marking should be done in the caller (nvshmemi_ibgda_check_cq)
                 *cq->cons_idx = idx; // Update cons_idx to avoid re-entry
                 return;
             }
@@ -772,34 +879,22 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
 
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
-    // #region agent log
-    // printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet entry: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
-    // #endregion
-    auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
-    auto qp = deep_ep_ibgda_primary_is_bad() ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
+    printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet entry: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
     auto state = ibgda_get_state();
+    auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
+    auto qp = deep_ep_ibgda_primary_is_bad(dst_pe) ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
     uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
-    // #region agent log
-    // printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet before poll: prod_idx=%llu, primary_bad=%d, using_qp_dev_idx=%u\n", 
-    //        prod_idx, deep_ep_ibgda_primary_is_bad(), qp->dev_idx);
-    // #endregion
-    // Avoid infinite hang if NIC is down: timeout triggers early return.
-    // Use the current QP's dev_idx (could be backup if primary is bad)
-    bool qp_timeout = nvshmemi_ibgda_check_cq(qp->tx_wq.cq, prod_idx, qp->dev_idx);
-    if (qp_timeout) {
-        // #region agent log
-        // printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet timeout detected (qp_dev_idx=%u), skipping CQ wait: dst_pe=%d, qp_id=%d\n", 
-        //        qp->dev_idx, dst_pe, qp_id);
-        // #endregion
-        // If timeout, just return without waiting. This prevents infinite hang in barrier.
-        // If primary was bad and backup also times out, we have no more options - just return.
-        return;
+    if (qp == primary_qp) {
+        auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
+        uint64_t backup_prod_idx = state->use_async_postsend ? ld_na_relaxed(backup_qp->tx_wq.prod_idx) : ld_na_relaxed(&backup_qp->mvars.tx_wq.ready_head);
+        bool timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_prod_idx, backup_qp->dev_idx, dst_pe);
+        if (timeout) {
+            // Backup QP timeout, use primary QP to complete the quiet operation
+            ibgda_poll_cq(backup_qp->tx_wq.cq, backup_prod_idx);
+        } else {
+            ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+        }
     }
-    // Success path: keep original semantics.
-    ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
-    // #region agent log
-    // printf("DEADLOCK_HYP_D: nvshmemi_ibgda_quiet exit: dst_pe=%d, qp_id=%d\n", dst_pe, qp_id);
-    // #endregion
 }
 
 }  // namespace deep_ep

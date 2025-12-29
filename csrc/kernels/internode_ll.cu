@@ -371,7 +371,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         // Wait local sends issued and send expert counts
         auto start_time = clock64();
         uint64_t wait_recv_cost = 0;
-        int wait_iter = 0;
+        // int wait_iter = 0;
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2 and 
             (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES) {
             // if (++wait_iter % 10000000 == 0) {
@@ -447,13 +447,11 @@ LOW_LATENCY_DISPATCH_RECV:
                            0                                                               // data not arrived
                        && (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES  // not timeout
                 ) {
-                    // #region agent log
-                    // if (++wait_iter % 10000000 == 0) {
-                    //     printf("DEADLOCK_HYP_F: dispatch recv waiting: src_rank=%d, wait_cost=%llu cycles, iter=%d\n",
-                    //            src_rank, wait_recv_cost, wait_iter);
-                    // }
-                    // #endregion
-                    ;
+                    if (++wait_iter % 10000000 == 0) {
+                        printf("DEADLOCK_HYP_F: dispatch recv waiting: rank=%d <---------------- src_rank=%d, wait_cost=%llu cycles, iter=%d\n",
+                               rank, src_rank, wait_recv_cost, wait_iter);
+                    }
+                    // ;
                 }
             }
             // Do not receive tokens if rank timeout or masked
@@ -469,8 +467,8 @@ LOW_LATENCY_DISPATCH_RECV:
                     trap();
                 atomicExch(mask_buffer_ptr + src_rank, 1);
                 // #region agent log
-                // printf("DEADLOCK_HYP_O: dispatch recv timeout handled: rank=%d, src_rank=%d, num_recv_tokens=%d\n",
-                //        rank, src_rank, num_recv_tokens);
+                printf("DEADLOCK_HYP_O: dispatch recv timeout handled: rank=%d, src_rank=%d, num_recv_tokens=%d\n",
+                       rank, src_rank, num_recv_tokens);
                 // #endregion
             }
 
