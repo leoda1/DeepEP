@@ -264,7 +264,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
-                        nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
+                        nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                     } else {
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
@@ -909,7 +909,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 // Issue RDMA
                 // NOTES: for zero-copy mode, we assume the data is already in the send buffer
                 if (dst_p2p_ptr == 0)
-                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                    nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
             }
         }
 
