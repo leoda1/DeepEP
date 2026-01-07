@@ -625,9 +625,16 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
     auto state = ibgda_get_state();
+    if (!IBGDA_FAULT_TOLERANCE_ENABLED) {
+        auto qp = ibgda_get_rc(dst_pe, qp_id);
+        uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+        ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+        return;
+    }
     auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
     auto qp = deep_ep_ibgda_primary_is_bad(dst_pe) ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
     uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+    
     if (qp == primary_qp) {
         auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
         uint64_t backup_prod_idx = state->use_async_postsend ? ld_na_relaxed(backup_qp->tx_wq.prod_idx) : ld_na_relaxed(&backup_qp->mvars.tx_wq.ready_head);
@@ -638,6 +645,8 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_i
         } else {
             ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
         }
+    } else {
+        ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
     }
 }
 
