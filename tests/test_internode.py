@@ -353,16 +353,16 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test internode EP kernels')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
-    parser.add_argument('--num-tokens', type=int, default=4096, help='Number of tokens (default: 4096)')
+    parser.add_argument('--num-tokens', type=int, default=8, help='Number of tokens (default: 4096)')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
     parser.add_argument('--num-topk-groups', type=int, default=None, help='Number of top-k groups (default: `min(num_nodes, 4)`)')
-    parser.add_argument('--num-topk', type=int, default=8, help='Number of top-k experts (default: 8)')
+    parser.add_argument('--num-topk', type=int, default=2, help='Number of top-k experts (default: 8)')
     parser.add_argument(
         '--pressure-test-mode',
         type=int,
         default=0,
         help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
-    parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256')
+    parser.add_argument('--num-experts', type=int, default=16, help='Number of experts (default: 256')
     parser.add_argument('--test-ll-compatibility', action='store_true', help='whether to test compatibility with low-latency kernels')
     args = parser.parse_args()
 

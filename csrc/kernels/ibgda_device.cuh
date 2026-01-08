@@ -223,6 +223,7 @@ __device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_de
         if (ibgda_cq_completed(cq, expected_wqe_idx)) return false;  // Completed successfully
 
         if ((ibgda_get_clock_cycles() - start_time) > kTimeoutCycles) {
+            printf("[%d] Timeout: target_pe=%d, expected_wqe_idx=%llu\n", nvshmemi_device_state_d.mype, target_pe, expected_wqe_idx);
             atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad[target_pe]), 1u);
             return true;  // Timeout = failure
         }
@@ -632,21 +633,23 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_i
         return;
     }
     auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
-    auto qp = deep_ep_ibgda_primary_is_bad(dst_pe) ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
-    uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+    auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
     
-    if (qp == primary_qp) {
-        auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
+    if (deep_ep_ibgda_primary_is_bad(dst_pe)) {
         uint64_t backup_prod_idx = state->use_async_postsend ? ld_na_relaxed(backup_qp->tx_wq.prod_idx) : ld_na_relaxed(&backup_qp->mvars.tx_wq.ready_head);
-        bool timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_prod_idx, backup_qp->dev_idx, dst_pe);
-        if (timeout) {
-            // Backup QP timeout, use primary QP to complete the quiet operation
-            ibgda_poll_cq(backup_qp->tx_wq.cq, backup_prod_idx);
-        } else {
-            ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
-        }
+        ibgda_poll_cq(backup_qp->tx_wq.cq, backup_prod_idx);
     } else {
-        ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+        uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(primary_qp->tx_wq.prod_idx) : ld_na_relaxed(&primary_qp->mvars.tx_wq.ready_head);
+        ibgda_poll_cq(primary_qp->tx_wq.cq, prod_idx);
+        
+        uint64_t backup_prod_idx = state->use_async_postsend ? ld_na_relaxed(backup_qp->tx_wq.prod_idx) : ld_na_relaxed(&backup_qp->mvars.tx_wq.ready_head);
+        if (backup_prod_idx > 0) {
+            bool backup_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_prod_idx, backup_qp->dev_idx, dst_pe);
+            if (!backup_timeout) {
+                // Backup QP operations completed, wait for them
+                ibgda_poll_cq(backup_qp->tx_wq.cq, backup_prod_idx);
+            }
+        }
     }
 }
 
