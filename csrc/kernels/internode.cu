@@ -192,7 +192,6 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
         __syncthreads();
-
         // Barrier
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
@@ -919,22 +918,14 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
             // Find next source RDMA rank (round-robin)
             start_time = clock64();
-            int loop_count = 0;
             while (true) {
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
-                    if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
-                        auto tail_before = cached_rdma_channel_tail;
+                    if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
                         cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
-                        if (lane_id == 0 and loop_count % 1000 == 0) {
-                            printf("[DEBUG] dispatch forwarder: waiting tail, channel=%d, src_rdma=%d, head=%d, tail_before=%d, tail_after=%d\n",
-                                   channel_id, src_rdma_rank, cached_rdma_channel_head, tail_before, cached_rdma_channel_tail);
-                        }
-                    }
-                    if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
-                        break;
+                        if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
+                            break;
                 }
-                loop_count++;
 
                 // Timeout check
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
