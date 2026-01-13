@@ -541,9 +541,6 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
                 printf("DeepEP barrier_block timeout: rank = %d, thread = %d, value = %d (continuing without barrier)\n", rank, thread_id, value);
                 timeout_occurred = true;
             }
-            // Break out of barrier on timeout to continue execution (fault tolerance)
-            // The barrier may not complete, but we continue to avoid hang
-            // All threads break together to maintain consistency
             break;
         }
     }

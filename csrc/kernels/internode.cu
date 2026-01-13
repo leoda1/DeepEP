@@ -192,6 +192,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
         __syncthreads();
+
         // Barrier
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
@@ -923,8 +924,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
                         cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
-                        if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
-                            break;
+                    if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
+                        break;
                 }
 
                 // Timeout check
