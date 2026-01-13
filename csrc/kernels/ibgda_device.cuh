@@ -217,13 +217,35 @@ __device__ static __forceinline__ bool nvshmemi_ibgda_check_cq(nvshmemi_ibgda_de
     if (cq == nullptr || cq->cqe == nullptr) {
         return true;  // No CQ = failure
     }
+    const auto cqe64 = static_cast<mlx5_cqe64*>(cq->cqe);
+    const uint32_t ncqes = cq->ncqes;
+    memory_fence_cta();
+    if (*cq->cons_idx >= expected_wqe_idx) {
+        return false;  // Already completed
+    }
+    
     constexpr uint64_t kTimeoutCycles = static_cast<uint64_t>(10.0 * 1.5e9);
     uint64_t start_time = ibgda_get_clock_cycles();
+    uint16_t wqe_counter;
     do {
-        if (ibgda_cq_completed(cq, expected_wqe_idx)) return false;  // Completed successfully
-
+        wqe_counter = HtoBE16(ld_na_relaxed(&cqe64->wqe_counter));
+        // Check if completed (same logic as ibgda_poll_cq)
+        if ((static_cast<uint16_t>(static_cast<uint16_t>(expected_wqe_idx) - wqe_counter - static_cast<uint16_t>(2)) >= ncqes)) {
+            // Completed successfully, update cons_idx like poll_cq
+            *cq->cons_idx = expected_wqe_idx;
+            memory_fence_cta();
+            return false;  // Success
+        }
+        
+        // Check timeout
         if ((ibgda_get_clock_cycles() - start_time) > kTimeoutCycles) {
-            atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad[target_pe]), 1u);
+            printf("[%d] Timeout: target_pe=%d, expected_wqe_idx=%llu\n", nvshmemi_device_state_d.mype, target_pe, expected_wqe_idx);
+            if (target_pe >= 0 && target_pe < 32) {
+                atomicExch(reinterpret_cast<unsigned int*>(&deep_ep_ibgda_primary_bad[target_pe]), 1u);
+            }
+            // Update cons_idx on timeout (like poll_cq)
+            *cq->cons_idx = expected_wqe_idx;
+            memory_fence_cta();
             return true;  // Timeout = failure
         }
     } while (true);
@@ -625,18 +647,24 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
     auto state = ibgda_get_state();
+    if (!IBGDA_FAULT_TOLERANCE_ENABLED) {
+        auto qp = ibgda_get_rc(dst_pe, qp_id);
+        uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+        ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+        return;
+    }
     auto primary_qp = ibgda_get_rc(dst_pe, qp_id);
-    auto qp = deep_ep_ibgda_primary_is_bad(dst_pe) ? ibgda_get_backup_rc(dst_pe, qp_id) : primary_qp;
-    uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
-    if (qp == primary_qp) {
-        auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
+    auto backup_qp = ibgda_get_backup_rc(dst_pe, qp_id);
+    
+    if (deep_ep_ibgda_primary_is_bad(dst_pe)) {
         uint64_t backup_prod_idx = state->use_async_postsend ? ld_na_relaxed(backup_qp->tx_wq.prod_idx) : ld_na_relaxed(&backup_qp->mvars.tx_wq.ready_head);
-        bool timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_prod_idx, backup_qp->dev_idx, dst_pe);
-        if (timeout) {
-            // Backup QP timeout, use primary QP to complete the quiet operation
-            ibgda_poll_cq(backup_qp->tx_wq.cq, backup_prod_idx);
-        } else {
-            ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+        ibgda_poll_cq(backup_qp->tx_wq.cq, backup_prod_idx);
+    } else {
+        uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(primary_qp->tx_wq.prod_idx) : ld_na_relaxed(&primary_qp->mvars.tx_wq.ready_head);
+        nvshmemi_ibgda_check_cq(primary_qp->tx_wq.cq, prod_idx, primary_qp->dev_idx, dst_pe);
+        uint64_t backup_prod_idx = state->use_async_postsend ? ld_na_relaxed(backup_qp->tx_wq.prod_idx) : ld_na_relaxed(&backup_qp->mvars.tx_wq.ready_head);
+        if (backup_prod_idx > 0) {
+            bool backup_timeout = nvshmemi_ibgda_check_cq(backup_qp->tx_wq.cq, backup_prod_idx, backup_qp->dev_idx, dst_pe);
         }
     }
 }

@@ -526,14 +526,22 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
 
     // Check timeout
     auto start_time = clock64();
+    constexpr uint64_t kTimeoutCycles = static_cast<uint64_t>(30.0 * 1.5e9);
+    bool timeout_occurred = false;
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
         if (__all_sync(0xffffffff, value <= 0))
             break;
 
-        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
-            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
-            trap();
+        bool timed_out = clock64() - start_time > kTimeoutCycles;
+        bool any_thread_timed_out = __any_sync(0xffffffff, timed_out);
+        
+        if (any_thread_timed_out) {
+            if (thread_id < kNumRanks && timed_out && timeout_occurred) {
+                printf("DeepEP barrier_block timeout: rank = %d, thread = %d, value = %d (continuing without barrier)\n", rank, thread_id, value);
+                timeout_occurred = true;
+            }
+            break;
         }
     }
     __syncthreads();
